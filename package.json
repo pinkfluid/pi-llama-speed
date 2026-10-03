@@ -1,0 +1,29 @@
+{
+  "name": "pi-llama-speed",
+  "version": "0.1.0",
+  "description": "Shows llama.cpp model loading, prompt processing and generation speed on pi's working line",
+  "type": "module",
+  "keywords": [
+    "pi-package"
+  ],
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*"
+  },
+  "scripts": {
+    "check": "tsc --noEmit",
+    "test": "node --experimental-strip-types test/harness.mjs"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/pinkfluid/pi-llama-speed.git"
+  },
+  "homepage": "https://github.com/pinkfluid/pi-llama-speed#readme",
+  "bugs": {
+    "url": "https://github.com/pinkfluid/pi-llama-speed/issues"
+  }
+}
