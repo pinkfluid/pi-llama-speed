@@ -19,8 +19,11 @@ is written to the footer status row either, so other extensions keep their space
 - **Prompt processing** comes from the server itself: llama.cpp sends `prompt_progress`
   (`total`, `cache`, `processed`, `time_ms`) when the request asks for it with
   `return_progress: true`, which this extension adds for local endpoints. The percentage, the rate
-  and the elapsed time all come from that same sample, so they agree with each other; the time is
-  what the server spent on the prompt, not the wall clock since the request was sent.
+  and the elapsed time all come from that same sample, so they agree with each other, and the time is
+  the server's own elapsed time for the request rather than a clock started here. Both the percent and
+  the rate count only the tokens that had to be computed: `processed` also includes cached tokens,
+  which llama.cpp applies in bulk and reports as a 0% first sample. Counting them made a mostly cached
+  prompt open at 84% and one sample read as thousands of tokens per second.
 - **Generation** is measured in this client over a 3 second sliding window. Everything the model
   generates counts: prose, thinking and tool call arguments, which is where written code streams.
   For llama.cpp this reads the provider's own chunks; for other APIs it falls back to pi's stream
@@ -52,7 +55,7 @@ numbers once the request finishes.
 
 | Command | Effect |
 |---|---|
-| `/speed` | Details for the current and last request, plus which endpoints were recognised |
+| `/speed` | Prompt processing numbers and generation numbers for the current and last request |
 | `/speed off` / `/speed on` | Stop or resume writing to the working line |
 | `/speed progress` | Toggle sending `return_progress` to local servers |
 | `/speed load` | Toggle reading the server's model state (loading status and progress) |

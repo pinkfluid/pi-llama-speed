@@ -36,8 +36,6 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 
 /** Minimum time between working line updates, in milliseconds. */
 const REPAINT_MS = 200;
-/** How many prefill samples to average for the live rate. */
-const PREFILL_WINDOW = 6;
 /** Sliding window used for the live generation rate. */
 const GEN_WINDOW_MS = 3000;
 /** Only look at model state once a reply is visibly late. */
@@ -76,11 +74,8 @@ type Request = {
   startedAt: number;
   firstDeltaAt?: number;
   lastDeltaAt?: number;
-  /** Latest prompt_progress from the server, plus the previous one for rates. */
+  /** Latest prompt_progress from the server; it is cumulative. */
   progress?: PromptProgress;
-  prevProcessed?: number;
-  prevTimeMs?: number;
-  prefillRates: number[];
   /** Streamed text characters, used to estimate tokens before usage arrives. */
   outTextChars: number;
   /** Tool call argument characters and non-empty fragments, counted separately. */
@@ -152,7 +147,6 @@ function newRequest(modelLabel: string, modelId: string, baseUrl: string, meterF
     modelId,
     baseUrl,
     startedAt: Date.now(),
-    prefillRates: [],
     outTextChars: 0,
     outArgChars: 0,
     outArgPieces: 0,
@@ -189,17 +183,29 @@ function usable(value: number | undefined): value is number {
   return typeof value === "number" && Number.isFinite(value) && value > 0;
 }
 
-/** Live rate from the server's prompt_progress samples. */
+/**
+ * How much prompt work the server says is done and still to do. `processed`
+ * counts cached tokens as well: llama.cpp applies the cached prefix in bulk and
+ * sends that first sample as 0% progress, so both the percent and the rate are
+ * measured against the tokens that actually had to be computed. Dividing cached
+ * tokens by the short time they take is what made a single sample read as
+ * thousands of tokens per second.
+ */
+function promptWork(progress: PromptProgress): { computed: number; remaining: number } {
+  const total = typeof progress.total === "number" && progress.total > 0 ? progress.total : 0;
+  const processed = typeof progress.processed === "number" ? progress.processed : 0;
+  const cached = typeof progress.cache === "number" && progress.cache > 0 ? Math.min(progress.cache, processed) : 0;
+  return { computed: Math.max(0, processed - cached), remaining: Math.max(0, total - cached) };
+}
+
+/** Prompt processing rate, from the server's own cumulative numbers. */
 function prefillRate(req: Request): number | undefined {
-  if (req.prefillRates.length > 0) {
-    const recent = req.prefillRates.slice(-PREFILL_WINDOW);
-    return recent.reduce((sum, value) => sum + value, 0) / recent.length;
-  }
   const progress = req.progress;
-  if (progress && typeof progress.processed === "number" && typeof progress.time_ms === "number" && progress.time_ms > 0) {
-    return (progress.processed / progress.time_ms) * 1000;
-  }
-  return undefined;
+  if (!progress) return undefined;
+  const elapsedMs = typeof progress.time_ms === "number" ? progress.time_ms : 0;
+  const { computed } = promptWork(progress);
+  if (computed <= 0 || elapsedMs <= 0) return undefined;
+  return (computed / elapsedMs) * 1000;
 }
 
 /** Output tokens so far: server-reported first, then our own estimate. */
@@ -350,8 +356,11 @@ function statusText(req: Request): string {
       return `⚡ ${waited}`;
     }
     const bits = ["⚡"];
-    const total = typeof progress.total === "number" && progress.total > 0 ? progress.total : undefined;
-    if (total) bits.push(`${progressBar(Math.min(1, progress.processed / total))} ${Math.round((progress.processed / total) * 100)}%`);
+    const { computed, remaining } = promptWork(progress);
+    if (remaining > 0) {
+      const done = Math.min(1, computed / remaining);
+      bits.push(`${progressBar(done)} ${Math.round(done * 100)}%`);
+    }
     const rate = prefillRate(req);
     if (usable(rate)) bits.push(`${fmtRate(rate)} t/s`);
     // Prefer the server's own prompt processing time; it belongs with its rate.
@@ -367,39 +376,48 @@ function statusText(req: Request): string {
   return bits.join(" ");
 }
 
-/** Summary of a finished request; only used by /speed and the debug log. */
+/**
+ * Summary of a finished request: prompt processing first, then generation.
+ * Only used by /speed and the debug log, never shown on its own.
+ */
 function recapText(req: Request): string | undefined {
-  const bits: string[] = [];
+  const groups: string[] = [];
+
+  // Prompt processing, straight from the server's own samples.
+  const progress = req.progress;
+  const pp: string[] = [];
+  const ppRate = prefillRate(req);
+  if (usable(ppRate)) pp.push(`${fmtRate(ppRate)} t/s`);
+  if (progress && typeof progress.processed === "number" && progress.processed > 0) {
+    pp.push(`${fmtTokens(progress.processed)} tok`);
+  }
+  if (progress && typeof progress.time_ms === "number" && progress.time_ms > 0) {
+    pp.push(fmtDuration(progress.time_ms / 1000));
+  }
+  if (pp.length > 0) groups.push(["⚡", ...pp].join(" "));
+
+  // Generation, measured here and corrected by the server's usage.
   if (req.firstDeltaAt) {
     const usage = req.usage;
-    const out = usage && typeof usage.output === "number" && usage.output > 0 ? usage.output : outputTokens(req);
-    const rate =
-      usage && typeof usage.output === "number" && usage.output > 0 && req.lastDeltaAt && req.lastDeltaAt > req.firstDeltaAt
-        ? (usage.output / (req.lastDeltaAt - req.firstDeltaAt)) * 1000
-        : generationRate(req);
-    bits.push("🔥");
-    bits.push(usable(rate) ? `${fmtRate(rate)} t/s` : "?");
-    bits.push(`${usage && typeof usage.output === "number" && usage.output > 0 ? "" : "~"}${fmtTokens(out)} tok`);
-  } else {
-    const rate = prefillRate(req);
-    const progress = req.progress;
-    const processed = progress?.processed;
-    if (!usable(rate) && !processed) return undefined;
-    bits.push("⚡");
-    if (usable(rate)) bits.push(`${fmtRate(rate)} t/s`);
-    if (processed) bits.push(`${fmtTokens(processed)} tok`);
-    if (progress && typeof progress.time_ms === "number" && progress.time_ms > 0) {
-      bits.push(fmtDuration(progress.time_ms / 1000));
-    }
+    const exact = typeof usage?.output === "number" && usage.output > 0;
+    const out = exact ? usage!.output : outputTokens(req);
+    const span = req.lastDeltaAt && req.lastDeltaAt > req.firstDeltaAt ? req.lastDeltaAt - req.firstDeltaAt : undefined;
+    const tg = exact && span ? (out / span) * 1000 : generationRate(req);
+    const gen: string[] = ["🔥", usable(tg) ? `${fmtRate(tg)} t/s` : "?", `${exact ? "" : "~"}${fmtTokens(out)} tok`];
+    if (span) gen.push(fmtDuration(span / 1000));
+    groups.push(gen.join(" "));
   }
+
   if (req.loadSeenAt && req.loadReadyAt && req.loadReadyAt > req.loadSeenAt) {
-    bits.push(`model ready in ${fmtDuration((req.loadReadyAt - req.loadSeenAt) / 1000)}`);
+    groups.push(`model ready in ${fmtDuration((req.loadReadyAt - req.loadSeenAt) / 1000)}`);
   }
   const cached = cacheFromUsage(req) ?? cacheShare(req.progress);
   // Only a cancelled or failed request is worth saying out loud.
-  if (req.stopReason === "aborted" || req.stopReason === "error") bits.push(req.stopReason);
-  else if (cached !== undefined) bits.push(`cache ${Math.round(cached * 100)}%`);
-  return bits.join(" ");
+  if (req.stopReason === "aborted" || req.stopReason === "error") groups.push(req.stopReason);
+  else if (cached !== undefined) groups.push(`cache ${Math.round(cached * 100)}%`);
+
+  if (groups.length === 0) return undefined;
+  return groups.join(" · ");
 }
 
 export default function (pi: ExtensionAPI) {
@@ -624,16 +642,6 @@ export default function (pi: ExtensionAPI) {
         llamaEndpoints.set(req.baseUrl, true);
         log("llama.cpp confirmed", req.baseUrl);
       }
-      if (typeof progress.processed === "number" && typeof progress.time_ms === "number") {
-        const dt = progress.time_ms - (req.prevTimeMs ?? 0);
-        const dp = progress.processed - (req.prevProcessed ?? 0);
-        if (dt > 0 && dp > 0) {
-          req.prefillRates.push((dp / dt) * 1000);
-          if (req.prefillRates.length > 20) req.prefillRates.shift();
-        }
-        req.prevProcessed = progress.processed;
-        req.prevTimeMs = progress.time_ms;
-      }
       req.progress = progress;
       return;
     }
@@ -776,8 +784,6 @@ export default function (pi: ExtensionAPI) {
       ];
       if (llamaEndpoints.size === 0) {
         lines.push("no llama.cpp endpoint seen yet this session");
-      } else {
-        for (const url of llamaEndpoints.keys()) lines.push(`confirmed: ${url}`);
       }
       if (req && !req.stopReason) lines.push(`current: ${statusText(req)}`);
       if (recap) lines.push(`last: ${recap}`);

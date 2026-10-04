@@ -86,15 +86,22 @@ end({ input: 100, output: 60, cacheRead: 0 });
 const llamaPayload = request(llama);
 console.log("llama payload injected:", JSON.stringify(llamaPayload).includes("return_progress"));
 for (const p of [
-  { total: 9000, cache: 6000, processed: 1500, time_ms: 500 },
-  { total: 9000, cache: 6000, processed: 3200, time_ms: 1100 },
-  { total: 9000, cache: 6000, processed: 4900, time_ms: 1600 },
+  // the cached prefix arrives in bulk; llama.cpp still calls that sample 0%
+  { total: 9000, cache: 6000, processed: 6000, time_ms: 200 },
+  { total: 9000, cache: 6000, processed: 7300, time_ms: 1100 },
+  { total: 9000, cache: 6000, processed: 8600, time_ms: 1600 },
 ]) {
   chunk({ prompt_progress: p });
   await sleep(70);
 }
 await sleep(250);
 show("llama, processing prompt");
+const promptLine = working;
+console.log(
+  "prefill rate is plausible:",
+  /\d+(?:\.\d+)?k? t\/s/.test(promptLine) && Number((promptLine.match(/([\d.]+)k? t\/s/)||[])[1]) < 3000,
+  `| ${promptLine}`
+);
 const streamed = [];
 for (let i = 0; i < 60; i++) {
   const piece = `tok${String(i).padStart(2, "0")}`;
@@ -109,6 +116,21 @@ show("llama, generating");
 end({ input: 3000, output: 61, cacheRead: 6000 });
 show("llama, after end");
 
+// 3a2. a cached prompt starts at 0%, not at cache/total
+request(llama);
+chunk({ prompt_progress: { total: 3054, cache: 2575, processed: 2575, time_ms: 931 } });
+await sleep(250);
+show("llama, cached prefix applied");
+const cacheStart = working;
+chunk({ prompt_progress: { total: 3054, cache: 2575, processed: 3054, time_ms: 1531 } });
+await sleep(250);
+show("llama, rest computed");
+const cacheDone = working;
+end({ input: 479, output: 0, cacheRead: 2575 }, "aborted");
+agentEnd();
+console.log("cached prompt starts at 0%:", / 0% /.test(cacheStart), "|", cacheStart);
+console.log("and reaches 100%:", / 100% /.test(cacheDone), "|", cacheDone);
+
 // 3b. one slow sample: percent, rate and the server's own processing time
 request(llama);
 chunk({ prompt_progress: { total: 9450, cache: 0, processed: 1323, time_ms: 4200 } });
@@ -121,6 +143,20 @@ await commands.get("speed").handler("", makeCtx(llama));
 const slowRecap = (notices.at(-1) || "").match(/last: (.*)$/m)?.[1];
 console.log("prefill line:", slowLine === "⚡ ▓░░░░░░░ 14% 315 t/s 4.2s", "|", slowLine);
 console.log("prefill recap:", slowRecap);
+
+// 3c. cached prompt tokens arrive in bulk: they must not fake the rate
+request(llama);
+chunk({ prompt_progress: { total: 60000, cache: 49000, processed: 49000, time_ms: 200 } });
+await sleep(60);
+chunk({ prompt_progress: { total: 60000, cache: 49000, processed: 50500, time_ms: 3200 } });
+await sleep(250);
+show("llama, cache then compute");
+const burstLine = working;
+end({ input: 11000, output: 0, cacheRead: 49000 }, "aborted");
+agentEnd();
+const burstRate = Number((burstLine.match(/([\d.]+) t\/s/) || [])[1]);
+console.log("cache burst line:", burstLine);
+console.log("rate after a cache burst stays sane:", Number.isFinite(burstRate) && burstRate < 1000, `| ${burstRate} t/s`);
 
 // 4. no double counting: an aborted run without usage estimates from the stream,
 //    and must land on the same number with or without pi's own events.
@@ -136,7 +172,7 @@ const estimateOf = async (withPiEvents) => {
   agentEnd();
   await commands.get("speed").handler("", makeCtx(llama));
   // compare the token estimate only; the rate jitters with scheduling
-  return (notices.at(-1) || "").match(/last: .*?(~?\d+(?:\.\d+)?k?) tok/)?.[1];
+  return (notices.at(-1) || "").match(/🔥 [^\n]+? (~?\d+(?:\.\d+)?k?) tok/)?.[1];
 };
 const providerOnly = await estimateOf(false);
 const bothSources = await estimateOf(true);

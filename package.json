@@ -1,6 +1,6 @@
 {
   "name": "pi-llama-speed",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Shows llama.cpp model loading, prompt processing and generation speed on pi's working line",
   "type": "module",
   "keywords": [
