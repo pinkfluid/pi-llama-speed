@@ -77,10 +77,37 @@ console.log(
   "copilot/anthropic untouched:",
   !JSON.stringify(copilotPayload).includes("return_progress") && !JSON.stringify(anthropicPayload).includes("return_progress"),
 );
-for (let i = 0; i < 20; i++) delta("token ");
+for (let i = 0; i < 20; i++) {
+  delta("token ");
+  await sleep(120);
+}
 await sleep(250);
 show("copilot, generating");
 end({ input: 100, output: 60, cacheRead: 0 });
+
+// 2b. a bursty cloud stream: three large flushes with pauses between them.
+//     600 tokens over ~15 s is really 40 t/s; a differential window would swing
+//     between a huge spike and a flat line instead.
+request(cloud);
+const burstRates = [];
+for (let burst = 0; burst < 3; burst++) {
+  delta("x".repeat(900));
+  for (let tick = 0; tick < 10; tick++) {
+    await sleep(500);
+    const match = working.match(/🔥 ([\d.]+) t\/s/);
+    if (match) burstRates.push(Number(match[1]));
+  }
+}
+show("cloud, bursty stream");
+const peak = Math.max(...burstRates);
+const mean = burstRates.reduce((sum, value) => sum + value, 0) / burstRates.length;
+end({ input: 0, output: 0, cacheRead: 0 }, "aborted");
+agentEnd();
+console.log(
+  "bursty stream stays near true throughput:",
+  peak > 0 && peak < 90,
+  `| ${burstRates.length} samples, peak ${peak.toFixed(1)} t/s, mean ${mean.toFixed(1)} t/s, real ~40 t/s`
+);
 
 // 3. first llama.cpp request: server samples bring the prefill line
 const llamaPayload = request(llama);

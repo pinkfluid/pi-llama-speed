@@ -37,7 +37,13 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 /** Minimum time between working line updates, in milliseconds. */
 const REPAINT_MS = 200;
 /** Sliding window used for the live generation rate. */
-const GEN_WINDOW_MS = 3000;
+/** Time constant of the smoothed generation rate, in milliseconds. */
+const GEN_EMA_TAU_MS = 2500;
+/** Intervals shorter than this are too short to measure a rate over. */
+const GEN_MIN_INTERVAL_MS = 100;
+/** Before the average exists, only report an average over the reply once it has
+ *  run this long: a single flush measured early reads as its own burst speed. */
+const GEN_MIN_SPAN_S = 3;
 /** Only look at model state once a reply is visibly late. */
 const LOAD_POLL_AFTER_MS = 1200;
 /** And at most this often while it stays late. */
@@ -83,7 +89,11 @@ type Request = {
   outArgPieces: number;
   /** Real output token count once the server reports usage. */
   outTokensReal?: number;
-  genSamples: Array<{ at: number; tokens: number }>;
+  /** Smoothed generation rate, in tokens per second. */
+  genEma?: number;
+  /** Sample the previous rate interval was measured from. */
+  genPrevAt?: number;
+  genPrevTokens?: number;
   /** Set as soon as the server sends prompt_progress; it identifies llama.cpp. */
   sawServerProgress: boolean;
   /** Count from pi's stream events instead of the provider's own chunks. */
@@ -150,7 +160,7 @@ function newRequest(modelLabel: string, modelId: string, baseUrl: string, meterF
     outTextChars: 0,
     outArgChars: 0,
     outArgPieces: 0,
-    genSamples: [],
+    genPrevTokens: 0,
     sawServerProgress: false,
     meterFromPi,
     meteredFromProvider: false,
@@ -234,23 +244,40 @@ function estimated(req: Request): boolean {
   return req.outTokensReal === undefined;
 }
 
-/** Live generation rate over a sliding window, corrected by real usage when known. */
-function generationRate(req: Request): number | undefined {
-  const now = Date.now();
+/**
+ * Fold one stream sample into the smoothed generation rate. Each rate is measured
+ * over the real time since the previous sample, so a flush that lands after a
+ * pause counts that pause too and lands on true throughput instead of on how fast
+ * the flush itself was. Intervals are then blended with an exponential moving
+ * average weighted by how long they were, which is what keeps a bursty cloud
+ * stream from swinging between spikes and flat lines.
+ */
+function updateGenerationAverage(req: Request, at: number): void {
   const tokens = outputTokens(req);
-  if (!req.firstDeltaAt || tokens <= 0) return undefined;
-  const samples = [...req.genSamples, { at: now, tokens }];
-  const windowStart = now - GEN_WINDOW_MS;
-  let oldest = samples[0];
-  for (const sample of samples) {
-    if (sample.at >= windowStart) break;
-    oldest = sample;
+  const prevAt = req.genPrevAt;
+  const prevTokens = req.genPrevTokens ?? 0;
+  if (prevAt === undefined) {
+    req.genPrevAt = at;
+    req.genPrevTokens = tokens;
+    return;
   }
-  const newest = samples[samples.length - 1];
-  const span = (newest.at - oldest.at) / 1000;
-  if (span >= 0.4 && newest.tokens > oldest.tokens) return (newest.tokens - oldest.tokens) / span;
-  const total = (now - req.firstDeltaAt) / 1000;
-  if (total >= 0.2) return tokens / total;
+  const dt = (at - prevAt) / 1000;
+  // too soon to measure, or nothing new: keep the previous anchor so the next
+  // interval covers everything since it
+  if (dt * 1000 < GEN_MIN_INTERVAL_MS || tokens <= prevTokens) return;
+  req.genPrevAt = at;
+  req.genPrevTokens = tokens;
+  const raw = (tokens - prevTokens) / dt;
+  const alpha = 1 - Math.exp(-dt / (GEN_EMA_TAU_MS / 1000));
+  req.genEma = req.genEma === undefined ? raw : alpha * raw + (1 - alpha) * req.genEma;
+}
+
+/** Live generation rate, smoothed; corrected by real usage in the summary. */
+function generationRate(req: Request): number | undefined {
+  if (req.genEma !== undefined) return req.genEma;
+  const tokens = outputTokens(req);
+  const span = req.firstDeltaAt ? (Date.now() - req.firstDeltaAt) / 1000 : 0;
+  if (tokens > 0 && span >= GEN_MIN_SPAN_S) return tokens / span;
   return undefined;
 }
 
@@ -676,8 +703,7 @@ export default function (pi: ExtensionAPI) {
     req.outTextChars += textChars;
     req.outArgChars += argChars;
     req.outArgPieces += argPieces;
-    req.genSamples.push({ at: now, tokens: outputTokens(req) });
-    if (req.genSamples.length > 400) req.genSamples.shift();
+    updateGenerationAverage(req, now);
   };
 
   pi.on("before_provider_request", (event, ctx) => {
@@ -721,8 +747,7 @@ export default function (pi: ExtensionAPI) {
     } else {
       req.outTextChars += part.delta.length;
     }
-    req.genSamples.push({ at: now, tokens: outputTokens(req) });
-    if (req.genSamples.length > 400) req.genSamples.shift();
+    updateGenerationAverage(req, now);
   });
 
   pi.on("message_end", (event, ctx) => {

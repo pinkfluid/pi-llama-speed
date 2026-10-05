@@ -24,8 +24,13 @@ is written to the footer status row either, so other extensions keep their space
   the rate count only the tokens that had to be computed: `processed` also includes cached tokens,
   which llama.cpp applies in bulk and reports as a 0% first sample. Counting them made a mostly cached
   prompt open at 84% and one sample read as thousands of tokens per second.
-- **Generation** is measured in this client over a 3 second sliding window. Everything the model
-  generates counts: prose, thinking and tool call arguments, which is where written code streams.
+- **Generation** is measured in this client as an exponential moving average over the intervals
+  between stream samples, each interval being counted tokens over the real time since the previous
+  sample (time constant about 2.5 s). Cloud streams arrive in flushes, and a flush that lands after a
+  stall counts that stall, so bursts blend into one steady throughput number instead of swinging
+  between spikes and flat lines; until such an interval exists the line shows elapsed time only.
+  Everything the model generates counts: prose, thinking and tool call arguments, which is where
+  written code streams.
   For llama.cpp this reads the provider's own chunks; for other APIs it falls back to pi's stream
   events, and never both. Tool *results* are not generation; they land in the next request's
   prompt.
